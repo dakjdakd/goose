@@ -246,8 +246,18 @@ pub fn map_http_error_to_provider_error(
     payload: Option<Value>,
     url: &str,
 ) -> ProviderError {
+    map_http_error(status, payload, url, None)
+}
+
+/// Folds `request_id` into the message text so every variant carries it without a new field.
+pub fn map_http_error(
+    status: StatusCode,
+    payload: Option<Value>,
+    url: &str,
+    request_id: Option<&str>,
+) -> ProviderError {
     let extract_message = || -> String {
-        payload
+        let message = payload
             .as_ref()
             .and_then(|p| {
                 p.get("error")
@@ -256,7 +266,11 @@ pub fn map_http_error_to_provider_error(
                     .and_then(|m| m.as_str())
                     .map(String::from)
             })
-            .unwrap_or_else(|| payload.as_ref().map(|p| p.to_string()).unwrap_or_default())
+            .unwrap_or_else(|| payload.as_ref().map(|p| p.to_string()).unwrap_or_default());
+        match request_id {
+            Some(id) => format!("{message} (provider request id: {id})"),
+            None => message,
+        }
     };
 
     let error = match status {
@@ -372,6 +386,15 @@ async fn read_response_body_with_limit(
     }
 }
 
+/// OpenAI-compatible gateways send `x-request-id`; Anthropic sends `request-id`.
+pub fn extract_request_id(headers: &HeaderMap) -> Option<String> {
+    ["x-request-id", "request-id"]
+        .iter()
+        .find_map(|name| headers.get(*name))
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
 pub async fn read_error_body(response: Response) -> Option<String> {
     read_response_body_with_limit(response, MAX_PROVIDER_JSON_RESPONSE_BYTES)
         .await
@@ -411,7 +434,8 @@ async fn handle_status_with_limit(
             .unwrap_or_default();
         let body = String::from_utf8_lossy(&body);
         let payload = serde_json::from_str::<Value>(&body).ok();
-        let mut err = map_http_error_to_provider_error(status, payload.clone(), &url);
+        let request_id = extract_request_id(&headers);
+        let mut err = map_http_error(status, payload.clone(), &url, request_id.as_deref());
         if let ProviderError::RateLimitExceeded { details, .. } = &err {
             err = ProviderError::RateLimitExceeded {
                 details: details.clone(),
@@ -612,6 +636,47 @@ mod tests {
             error.insert(key.to_string(), value);
         }
         json!({ "error": error })
+    }
+
+    #[tokio::test]
+    async fn error_carries_provider_request_id() {
+        let raw = b"HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\nx-request-id: req_abc123\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"boom\"}}".to_vec();
+        let response = response_from_raw(raw).await;
+
+        let err = handle_status(response).await.unwrap_err();
+        assert!(
+            err.to_string().contains("req_abc123"),
+            "request id should reach the user on failure, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_keeps_retry_delay_and_request_id() {
+        let raw = b"HTTP/1.1 429 Too Many Requests\r\ncontent-type: application/json\r\nretry-after: 17\r\nx-request-id: req_rate\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"slow down\"}}".to_vec();
+        let response = response_from_raw(raw).await;
+
+        let err = handle_status(response).await.unwrap_err();
+        match &err {
+            ProviderError::RateLimitExceeded {
+                details,
+                retry_delay,
+            } => {
+                assert_eq!(*retry_delay, Some(Duration::from_secs(17)));
+                assert!(details.contains("req_rate"), "got: {details}");
+            }
+            other => panic!("expected rate limit, got: {other}"),
+        }
+    }
+
+    #[test]
+    fn request_id_accepts_anthropic_header_name() {
+        let mut headers = HeaderMap::new();
+        headers.insert("request-id", "req_anthropic".parse().unwrap());
+        assert_eq!(
+            extract_request_id(&headers).as_deref(),
+            Some("req_anthropic")
+        );
+        assert!(extract_request_id(&empty_headers()).is_none());
     }
 
     #[test]
